@@ -1,0 +1,19 @@
+[package]
+name = "nym-dumpster"
+version = "0.1.0"
+homepage = "https://kill.me"
+description = "Native IO stream over a dumpster fire"
+authors = ["Dyne.org foundation <foundation@dyne.org>"]
+repository = "https://github.com/parazyd/nym-dumpster"
+license = "AGPL-3.0-only"
+edition = "2021"
+
+[dependencies]
+async-tungstenite = { version = "0", default-features = false, features = ["async-std-runtime"] }
+
+async-std = { version = "1", features = ["attributes"] }
+futures = "0"
+rand = "0"
+
+nym-sphinx = {git="https://github.com/nymtech/nym", tag="v1.1.22"}
+nym-websocket = {package="nym-client-websocket-requests", git="https://github.com/nymtech/nym", tag="v1.1.22"}
