@@ -17,9 +17,15 @@ $ ./nym-client init --id acab
 $ ./nym-client run --id acab
 ```
 
-2. Use the library.
+2. Wait for https://github.com/nymtech/nym/issues/3610
 
+3. Run the examples
 
-# License
+```
+$ cargo run --release --example server
+$ cargo run --release --example client
+```
+
+## License
 
 GNU AGPL 3.0
