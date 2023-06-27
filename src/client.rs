@@ -27,7 +27,10 @@ use nym_sphinx::addressing::clients::Recipient;
 use nym_websocket::{requests::ClientRequest, responses::ServerResponse};
 use rand::{rngs::OsRng, Rng};
 
-use super::{ws_to_io_error, MessageType};
+use super::{io_error, ws_to_io_error, MessageType};
+
+/// SURBs to send along with messages.
+const REPLY_SURBS: u32 = 10;
 
 /// A Nym client implementing [`AsyncRead`] and [`AsyncWrite`]
 pub struct NymClient {
@@ -42,9 +45,13 @@ pub struct NymClient {
 }
 
 impl NymClient {
-    pub async fn connect(endpoint: Recipient) -> io::Result<Self> {
+    /// Instantiate a new Nym connection to the given endpoint. Takes optional
+    /// `ws_host` string pointing to where nym-client is listening. If `None`,
+    /// uses the default address. Returns `NymClient`, which acts as a stream
+    /// and implements the async IO methods [`AsyncRead`] and [`AsyncWrite`].
+    pub async fn connect(endpoint: Recipient, ws_host: Option<&str>) -> io::Result<Self> {
         // Connect to nym-client with websocket
-        let (mut stream, _) = match connect_async("ws://127.0.0.1:1977").await {
+        let (mut stream, _) = match connect_async(ws_host.unwrap_or("ws://127.0.0.1:1977")).await {
             Ok(s) => s,
             Err(e) => return Err(ws_to_io_error(e)),
         };
@@ -95,7 +102,7 @@ impl NymClient {
         ClientRequest::SendAnonymous {
             recipient,
             message,
-            reply_surbs: 5,
+            reply_surbs: REPLY_SURBS,
             connection_id: Some(conn_id),
         }
     }
@@ -109,7 +116,7 @@ impl NymClient {
         ClientRequest::SendAnonymous {
             recipient,
             message,
-            reply_surbs: 5,
+            reply_surbs: REPLY_SURBS,
             connection_id: Some(conn_id),
         }
     }
@@ -124,7 +131,7 @@ impl NymClient {
         ClientRequest::SendAnonymous {
             recipient,
             message,
-            reply_surbs: 5,
+            reply_surbs: REPLY_SURBS,
             connection_id: Some(conn_id),
         }
     }
@@ -148,7 +155,7 @@ impl AsyncRead for NymClient {
         // We got _some_ data. Let's see what to do with it.
         let response = match ServerResponse::deserialize(&payload) {
             Ok(resp) => resp,
-            Err(e) => return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e.to_string()))),
+            Err(e) => return Poll::Ready(Err(io_error(&e.to_string()))),
         };
 
         // Now we see what to do with the deserialized response. We actually
@@ -160,9 +167,7 @@ impl AsyncRead for NymClient {
         // since that's how we know where to send stuff.
         let payload_data = match response {
             ServerResponse::Received(m) => m.message,
-            ServerResponse::Error(e) => {
-                return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e.to_string())))
-            }
+            ServerResponse::Error(e) => return Poll::Ready(Err(io_error(&e.to_string()))),
             _ => return Poll::Pending,
         };
 
@@ -171,7 +176,7 @@ impl AsyncRead for NymClient {
             return Poll::Pending;
         }
 
-        // Ignore if not MessageType::Data
+        // Ignore if not MessageType::Data or MessageType::Close
         let msg_type = match MessageType::try_from(payload_data[0]) {
             Ok(MessageType::Data) => MessageType::Data,
             Ok(MessageType::Close) => MessageType::Close,
@@ -185,13 +190,10 @@ impl AsyncRead for NymClient {
 
         // The endpoint told us that the connection is closing. Propagate it.
         if msg_type == MessageType::Close {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "connection closed by server",
-            )));
+            return Poll::Ready(Err(io_error("connection closed by server")));
         }
 
-        // Finally read it into the buffer
+        // Finally read the data into the buffer
         let data = &payload_data[9..];
         let length = std::cmp::min(buf.len(), data.len());
         buf[..length].copy_from_slice(&data[..length]);

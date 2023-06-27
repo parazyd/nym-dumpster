@@ -28,7 +28,7 @@ use nym_sphinx::anonymous_replies::requests::AnonymousSenderTag;
 use nym_websocket::{requests::ClientRequest, responses::ServerResponse};
 use rand::{rngs::OsRng, Rng};
 
-use super::{ws_to_io_error, MessageType};
+use super::{io_error, ws_to_io_error, MessageType};
 
 /// A Nym listener implementing [`AsyncRead`] and [`AsyncWrite`]
 pub struct NymServer {
@@ -44,9 +44,13 @@ pub struct NymServer {
 }
 
 impl NymServer {
-    pub async fn bind() -> io::Result<(Self, Recipient)> {
+    /// Start accepting Nym connections. Takes optional `ws_host` string pointing
+    /// to where nym-client is listening. If `None`, uses the default address.
+    /// Returns `NymServer`, which acts as a stream and implements the async IO
+    /// methods [`AsyncRead`] and [`AsyncWrite`].
+    pub async fn accept(ws_host: Option<&str>) -> io::Result<(Self, Recipient)> {
         // Connect to nym-client with websocket
-        let (mut stream, _) = match connect_async("ws://127.0.0.1:1977").await {
+        let (mut stream, _) = match connect_async(ws_host.unwrap_or("ws://127.0.0.1:1977")).await {
             Ok(s) => s,
             Err(e) => return Err(ws_to_io_error(e)),
         };
@@ -57,28 +61,20 @@ impl NymServer {
             return Err(ws_to_io_error(e));
         }
 
+        // Send the SelfAddress request to the websocket endpoint.
         let response = match stream.next().await.unwrap().unwrap() {
             Message::Binary(payload) => ServerResponse::deserialize(&payload).unwrap(),
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "Failed to retrieve listener addr",
-                ))
-            }
+            _ => return Err(io_error("Failed to retrieve listener addr")),
         };
 
+        // Parse response
         let listen_addr = match response {
             ServerResponse::SelfAddress(recipient) => *recipient,
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "Failed to retrieve listener addr",
-                ))
-            }
+            _ => return Err(io_error("Failed to retrieve listener addr")),
         };
 
         // Generate a random connection ID. This will get overridden when we
-        // get an `Open`. It's not set to 0 because of potential DoS attacks
+        // get an `Open`. It's not set to 0 because of potential DoS attacks.
         let conn_id = OsRng::gen::<u64>(&mut OsRng);
 
         Ok((
@@ -163,14 +159,16 @@ impl AsyncRead for NymServer {
         // We got _some_ data. Let's see what to do with it.
         let response = match ServerResponse::deserialize(&payload) {
             Ok(resp) => resp,
-            Err(e) => return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e.to_string()))),
+            Err(e) => return Poll::Ready(Err(io_error(&e.to_string()))),
         };
 
         // We need to check what's contained in the deserialized response.
         // There's two cases we have to handle here:
+        //
         // 1. If our `sender_tag` is None, this means we don't consider this
         //    connection instantiated. In this case, we only care about the
         //    `Open` message.
+        //
         // 2. If our `sender_tag` is _not_ None, this means we already have
         //    a "connection". In this case, we care about `Data` or `Close`.
         //    In case we get another `Open` for the same `conn_id`, we will
@@ -181,9 +179,7 @@ impl AsyncRead for NymServer {
 
         let (payload_data, sender_tag) = match response {
             ServerResponse::Received(m) => (m.message, m.sender_tag),
-            ServerResponse::Error(e) => {
-                return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e.to_string())));
-            }
+            ServerResponse::Error(e) => return Poll::Ready(Err(io_error(&e.to_string()))),
             _ => return Poll::Pending,
         };
 
@@ -201,10 +197,12 @@ impl AsyncRead for NymServer {
         let conn_id = u64::from_be_bytes(payload_data[1..9].try_into().unwrap());
 
         match MessageType::try_from(payload_data[0]) {
+            // Connection Open request
             Ok(MessageType::Open) => {
                 if self.sender_tag.is_none() {
                     // Someone opened a connection with us
                     // Now we consider this connection opened
+                    // This is the endpoint of [`NymClient::connect`].
                     self.sender_tag = Some(sender_tag);
                     self.conn_id = conn_id;
                     return Poll::Pending;
@@ -212,18 +210,22 @@ impl AsyncRead for NymServer {
 
                 if self.sender_tag.is_some() && self.conn_id == conn_id {
                     // This is where we return the ConnectionReset
+                    // because we have a sender tag, so we shouldn't
+                    // be getting an `Open` again.
                     return Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()));
                 }
 
                 if self.sender_tag.is_some() && self.conn_id != conn_id {
-                    // This is another client
+                    // This is another client because conn_id doesn't match.
                     return Poll::Pending;
                 }
             }
-
+            // Connection Close request
             Ok(MessageType::Close) => {
                 if self.sender_tag.is_none() {
                     // Not sure what to do here, maybe also close?
+                    // We don't have an open connection so we're just
+                    // ignoring it for now.
                     return Poll::Pending;
                 }
 
@@ -233,25 +235,30 @@ impl AsyncRead for NymServer {
                 }
 
                 if self.sender_tag.is_some() && self.conn_id != conn_id {
-                    // This is another client
+                    // This is another client because conn_id doesn't match.
                     return Poll::Pending;
                 }
             }
-
+            // Connection Data
             Ok(MessageType::Data) => {
                 if self.sender_tag.is_none() {
-                    // We don't know the sender tag, so we ignore this
+                    // We don't know the sender tag, so we ignore this.
                     return Poll::Pending;
                 }
 
                 if self.sender_tag.is_some() && self.conn_id == conn_id {
                     // We got some data. Update the `sender_tag`.
-                    // TODO: I don't know if this is either dangerous or necessary.
+                    // This is the only place where this match statement
+                    // should pass and the data should be read.
+                    // TODO: I don't know if this sender_tag dance is either
+                    //       dangerous or necessary.
+                    println!("OLD SENDER TAG: {:?}", self.sender_tag);
+                    println!("NEW SENDER TAG: {:?}", Some(sender_tag));
                     self.sender_tag = Some(sender_tag);
                 }
 
                 if self.sender_tag.is_some() && self.conn_id != conn_id {
-                    // This is another client
+                    // This is another client because conn_id doesn't match.
                     return Poll::Pending;
                 }
             }
@@ -259,8 +266,9 @@ impl AsyncRead for NymServer {
             Err(_) => return Poll::Pending,
         }
 
-        // The above `match` should only pass if the connection is open (we have a
-        // `sender_tag`), we got a `Data` message, and the connection ID matches.
+        // The above `match` should only pass if the connection is open
+        // (we have a `sender_tag`), we got a `Data` message, and the
+        // connection ID matches.
         let data = &payload_data[9..];
         let length = std::cmp::min(buf.len(), data.len());
         buf[..length].copy_from_slice(&data[..length]);

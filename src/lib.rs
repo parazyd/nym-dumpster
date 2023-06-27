@@ -55,3 +55,8 @@ fn ws_to_io_error(e: async_tungstenite::tungstenite::Error) -> io::Error {
         err => io::Error::new(io::ErrorKind::Other, err.to_string()),
     }
 }
+
+/// Internal function for cleaner use of `io::ErrorKind::Other`
+fn io_error(msg: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, msg)
+}
