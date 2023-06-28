@@ -2,7 +2,7 @@
 name = "nym-dumpster"
 version = "0.0.1"
 homepage = "https://github.com/parazyd/nym-dumpster"
-description = "Native IO stream over a dumpster fire"
+description = "Asynchronous IO streams over the Nym network"
 authors = ["parazyd <parazyd@dyne.org>"]
 repository = "https://github.com/parazyd/nym-dumpster"
 license = "AGPL-3.0-only"
