@@ -17,12 +17,14 @@
 
 use std::io;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 
 use async_std::net::TcpStream;
 use async_tungstenite::async_std::connect_async;
 use async_tungstenite::{tungstenite::protocol::Message, WebSocketStream};
-use futures::{AsyncRead, AsyncWrite, FutureExt, SinkExt, StreamExt};
+use futures::{AsyncRead, AsyncWrite, AsyncWriteExt, FutureExt, SinkExt, StreamExt};
+use log::debug;
 use nym_sphinx::addressing::clients::Recipient;
 use nym_websocket::{requests::ClientRequest, responses::ServerResponse};
 use rand::{rngs::OsRng, Rng};
@@ -33,6 +35,7 @@ use super::{io_error, ws_to_io_error, MessageType};
 const REPLY_SURBS: u32 = 10;
 
 /// A Nym client implementing [`AsyncRead`] and [`AsyncWrite`]
+#[derive(Debug)]
 pub struct NymClient {
     /// The underlying websocket stream connecting to nym-client
     stream: WebSocketStream<TcpStream>,
@@ -42,6 +45,8 @@ pub struct NymClient {
     /// Only the messages containing this ID will actually be read by
     /// this instance. Other messages should be read by other instances.
     conn_id: u64,
+    /// Connection open
+    conn_open: AtomicBool,
 }
 
 impl NymClient {
@@ -49,9 +54,15 @@ impl NymClient {
     /// `ws_host` string pointing to where nym-client is listening. If `None`,
     /// uses the default address. Returns `NymClient`, which acts as a stream
     /// and implements the async IO methods [`AsyncRead`] and [`AsyncWrite`].
+    ///
+    /// ```no_run
+    /// let stream = NymClient::connect(rcpt, None).await?;
+    /// ```
     pub async fn connect(endpoint: Recipient, ws_host: Option<&str>) -> io::Result<Self> {
         // Connect to nym-client with websocket
-        let (mut stream, _) = match connect_async(ws_host.unwrap_or("ws://127.0.0.1:1977")).await {
+        let ws_host = ws_host.unwrap_or("ws://127.0.0.1:1977");
+        debug!("Connecting to nym-client @ {}", ws_host);
+        let (mut stream, _) = match connect_async(ws_host).await {
             Ok(s) => s,
             Err(e) => return Err(ws_to_io_error(e)),
         };
@@ -60,31 +71,37 @@ impl NymClient {
         let conn_id = OsRng::gen::<u64>(&mut OsRng);
 
         // We will send the receiver a message telling them we opened a connection
+        debug!("Sending \"Open\" to {}", endpoint);
         let payload = Message::Binary(Self::msg_open(endpoint, conn_id).serialize());
         if let Err(e) = stream.send(payload).await {
             return Err(ws_to_io_error(e));
         }
 
+        debug!("Opened connection to {}", endpoint);
         Ok(Self {
             stream,
             endpoint,
             conn_id,
+            conn_open: AtomicBool::new(true),
         })
     }
 
     /// Attempt to cleanly close the active connection
-    pub async fn close(&mut self) -> io::Result<()> {
+    pub async fn shutdown(&mut self) -> io::Result<()> {
         // We will send the receiver a message telling them we're closing our connection
-        let payload = Message::Binary(Self::msg_close(self.endpoint, self.conn_id).serialize());
+        debug!(
+            "Sending \"Close\" to {} (cid {})",
+            self.endpoint, self.conn_id
+        );
+        let payload = Message::Binary(self.msg_close().serialize());
         if let Err(e) = self.stream.send(payload).await {
             return Err(ws_to_io_error(e));
         }
 
         // Close the websocket stream cleanly
-        if let Err(e) = self.stream.close(None).await {
-            return Err(ws_to_io_error(e));
-        }
-
+        self.flush().await?;
+        self.close().await?;
+        *self.conn_open.get_mut() = false;
         Ok(())
     }
 
@@ -108,31 +125,31 @@ impl NymClient {
     }
 
     /// Construct a `Close` message. Used when closing the connection.
-    fn msg_close(recipient: Recipient, conn_id: u64) -> ClientRequest {
+    fn msg_close(&self) -> ClientRequest {
         let mut message = Vec::with_capacity(9);
         message.push(MessageType::Close as u8);
-        message.extend_from_slice(&conn_id.to_be_bytes());
+        message.extend_from_slice(&self.conn_id.to_be_bytes());
 
         ClientRequest::SendAnonymous {
-            recipient,
+            recipient: self.endpoint,
             message,
             reply_surbs: REPLY_SURBS,
-            connection_id: Some(conn_id),
+            connection_id: Some(self.conn_id),
         }
     }
 
     /// Construct a `Data` message. Used when sending data into the connection.
-    fn msg_data(recipient: Recipient, conn_id: u64, data: &[u8]) -> ClientRequest {
+    fn msg_data(&self, data: &[u8]) -> ClientRequest {
         let mut message = Vec::with_capacity(9 + data.len());
         message.push(MessageType::Data as u8);
-        message.extend_from_slice(&conn_id.to_be_bytes());
+        message.extend_from_slice(&self.conn_id.to_be_bytes());
         message.extend_from_slice(data);
 
         ClientRequest::SendAnonymous {
-            recipient,
+            recipient: self.endpoint,
             message,
             reply_surbs: REPLY_SURBS,
-            connection_id: Some(conn_id),
+            connection_id: Some(self.conn_id),
         }
     }
 }
@@ -143,6 +160,10 @@ impl AsyncRead for NymClient {
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
+        if !self.conn_open.load(Ordering::SeqCst) {
+            return Poll::Ready(Err(io::ErrorKind::ConnectionRefused.into()));
+        }
+
         let message = futures::ready!(self.stream.next().poll_unpin(cx));
 
         let payload = match message {
@@ -158,13 +179,12 @@ impl AsyncRead for NymClient {
             Err(e) => return Poll::Ready(Err(io_error(&e.to_string()))),
         };
 
-        // Now we see what to do with the deserialized response. We actually
-        // just want to read a payload that's meant for us. This should be a
-        // ReconstructedMessage, and should contain MessageType::Data along
-        // with any number of bytes. Anything else will be ignored and nothing
-        // will be reported as read. Here we also don't care about the sender
-        // tag since we're a client. We do care about it in the server-side
-        // since that's how we know where to send stuff.
+        // Now we see what to do with the deserialized response.
+        // We're only interested in `Data` and `Close`, and that the conn_id
+        // actually matches. Anything else will be ignored and nothing will
+        // be reported as read. Here we also don't care about the sender tag
+        // since we're a client. We do care about it server-side since that's
+        // how we know where to send stuff.
         let payload_data = match response {
             ServerResponse::Received(m) => m.message,
             ServerResponse::Error(e) => return Poll::Ready(Err(io_error(&e.to_string()))),
@@ -184,13 +204,15 @@ impl AsyncRead for NymClient {
         };
 
         // Check if this is actually data for us
-        if u64::from_be_bytes(payload_data[1..9].try_into().unwrap()) != self.conn_id {
+        let conn_id = u64::from_be_bytes(payload_data[1..9].try_into().unwrap());
+        if conn_id != self.conn_id {
             return Poll::Pending;
         }
 
         // The endpoint told us that the connection is closing. Propagate it.
         if msg_type == MessageType::Close {
-            return Poll::Ready(Err(io_error("connection closed by server")));
+            debug!("Closing connection to {}", self.endpoint);
+            return Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()));
         }
 
         // Finally read the data into the buffer
@@ -207,8 +229,12 @@ impl AsyncWrite for NymClient {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        if !self.conn_open.load(Ordering::SeqCst) {
+            return Poll::Ready(Err(io::ErrorKind::ConnectionRefused.into()));
+        }
+
         // Construct the `Data` message
-        let message = Message::Binary(Self::msg_data(self.endpoint, self.conn_id, buf).serialize());
+        let message = Message::Binary(self.msg_data(buf).serialize());
 
         // Just fucking send it
         match self.as_mut().stream.send(message).poll_unpin(cx) {

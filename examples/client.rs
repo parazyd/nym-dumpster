@@ -18,6 +18,7 @@
 use async_tungstenite::async_std::connect_async;
 use async_tungstenite::tungstenite::protocol::Message;
 use futures::{AsyncReadExt, AsyncWriteExt, SinkExt, StreamExt};
+use log::info;
 use nym_sphinx::addressing::clients::Recipient;
 use nym_websocket::{requests::ClientRequest, responses::ServerResponse};
 
@@ -42,18 +43,22 @@ async fn get_self_addr() -> Recipient {
     listen_addr
 }
 
-#[async_std::main]
+#[async_attributes::main]
 async fn main() {
+    env_logger::init();
+
     let rcpt = get_self_addr().await;
 
     let mut client = NymClient::connect(rcpt, None).await.unwrap();
 
     let buf = vec![0xde, 0xad, 0xbe, 0xef];
-    println!("Client #0 WRITE: {:?}", buf);
+    info!("Client #0 WRITE: {:?}", buf);
     client.write_all(&buf).await.unwrap();
 
     let mut rep = vec![0u8; 4];
     client.read_exact(&mut rep).await.unwrap();
-    println!("Client #0 READ: {:?}", rep);
+    info!("Client #0 READ: {:?}", rep);
     assert_eq!(buf, rep);
+
+    client.shutdown().await.unwrap();
 }

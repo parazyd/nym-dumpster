@@ -15,44 +15,47 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-use async_std::{channel, task};
+use async_std::{sync::Arc, task};
 use futures::{AsyncReadExt, AsyncWriteExt};
+use log::{error, info};
 
 use nym_dumpster::NymServer;
 
-#[async_std::main]
+#[async_attributes::main]
 async fn main() {
-    let (stop_tx, stop_rx) = channel::bounded::<()>(1);
+    env_logger::init();
 
-    let (mut stream, addr) = NymServer::accept(None).await.unwrap();
+    let listener = Arc::new(NymServer::bind(None).await.unwrap());
+    info!("Bound listener");
 
-    task::spawn(async move {
-        loop {
-            let mut buf = vec![0_u8; 1024];
+    loop {
+        let (mut stream, addr) = listener.clone().accept().await.unwrap();
+        info!("Nym Address: {}", addr);
+        info!("Accepted connection for ID {}", stream.conn_id());
+        task::spawn(async move {
+            loop {
+                let mut buf = vec![0u8; 1024];
 
-            let n = match stream.read(&mut buf).await {
-                Ok(n) if n == 0 => {
-                    println!("Listener #0 closed connection for ID {}", stream.conn_id());
-                    break;
-                }
+                let n = match stream.read(&mut buf).await {
+                    Ok(n) if n == 0 => {
+                        info!("Closed connection for ID {}", stream.conn_id());
+                        break;
+                    }
 
-                Ok(n) => n,
+                    Ok(n) => n,
 
-                Err(e) => {
-                    println!("Listener #0 failed reading: {}", e);
-                    break;
-                }
-            };
+                    Err(e) => {
+                        error!("Failed reading for ID {}: {}", stream.conn_id(), e);
+                        break;
+                    }
+                };
 
-            println!("Listener #0 READ: {:?}", &buf[..n]);
-            stream.write_all(&buf[..n]).await.unwrap();
-        }
+                info!("Listener READ: {:?}", &buf[..n]);
+                stream.write_all(&buf[..n]).await.unwrap();
+            }
 
-        stream.close().await.unwrap();
-        stop_tx.send(()).await.unwrap();
-    });
-
-    println!("Listener #0 listening at {}", addr);
-
-    stop_rx.recv().await.unwrap();
+            stream.shutdown().await.unwrap();
+            info!("Closed listener for ID {}", stream.conn_id());
+        });
+    }
 }

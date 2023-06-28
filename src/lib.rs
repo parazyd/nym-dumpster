@@ -28,7 +28,7 @@ pub use server::NymServer;
 /// Message types that are being sent and recieved. We use this in order
 /// to be able to open and close cconnections, and to send binary data.
 #[repr(u8)]
-#[derive(PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub enum MessageType {
     Open = 0x00,
     Data = 0x01,
@@ -43,20 +43,22 @@ impl TryFrom<u8> for MessageType {
             0x00 => Ok(Self::Open),
             0x01 => Ok(Self::Data),
             0x02 => Ok(Self::Close),
-            _ => Err(io::Error::new(io::ErrorKind::Other, "Invalid MessageType")),
+            _ => Err(io_error("Invalid MessageType")),
         }
     }
 }
 
 /// Internal function to translate tungstenite errors to io errors.
+#[inline]
 fn ws_to_io_error(e: async_tungstenite::tungstenite::Error) -> io::Error {
     match e {
         async_tungstenite::tungstenite::Error::Io(err) => err,
-        err => io::Error::new(io::ErrorKind::Other, err.to_string()),
+        err => io_error(&err.to_string()),
     }
 }
 
 /// Internal function for cleaner use of `io::ErrorKind::Other`
+#[inline]
 fn io_error(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::Other, msg)
 }
